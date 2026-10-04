@@ -5,25 +5,31 @@ using System.Text;
 using HostMgd.ApplicationServices; // Для HostApplication
 using System.Management;
 using Teigha.Runtime;
+using System.Windows.Forms;
+using System.Globalization;
 
 // 1. Обязательный атрибут, который указывает nanoCAD на ваш стартовый класс
 [assembly: ExtensionApplication(typeof(SunRise.SunRise))]
 
 namespace SunRise
 {
+    
+    using System.Globalization;
     using System.Reflection;
     using System.Runtime.InteropServices;
     using System.Text.RegularExpressions;
     using HostMgd.EditorInput;
+    using HostMgd.Windows;
     using Teigha.DatabaseServices;
+    using Teigha.LayerManager;
     using Teigha.Runtime;
 
     public class SunRise: IExtensionApplication
     {
         public void Initialize()
         {
-            var ed = Application.DocumentManager.MdiActiveDocument.Editor;
-            ed.WriteMessage("Расширение SunRise v:0.0.0.1 успешно загружено");
+            var ed = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
+            ed.WriteMessage("Расширение SunRise v:{0} успешно загружено", Assembly.GetExecutingAssembly().GetName().Version);
             ed.WriteMessage("Введите команду SunRiseInfo, для получения подробностей");
         }
 
@@ -35,14 +41,17 @@ namespace SunRise
         [CommandMethod("SunRiseInfo")]
         public void Info()
         {
-            var ed = Application.DocumentManager.MdiActiveDocument.Editor;
-            ed.WriteMessage("Расширение SunRise версия 0.0.0.1"); 
+            var ed = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
+            ed.WriteMessage("Расширение SunRise версия " + Assembly.GetExecutingAssembly().GetName().Version); 
             ed.WriteMessage("Доступные команды: ");
             ed.WriteMessage("CheckDisk - проверяет СМАРТ-статуса диска, может не работать без админских прав");
             ed.WriteMessage("PaintItBlack - красит все объекты в черный цвет, даже внутри блоков может быть необходимо для печати. Примечание: чтобы перекрасить МТекст-ы, нужно их разбить");
             ed.WriteMessage("ConvertToMText - преобразует текст(или тексты) в МТекст. При указании более одного текста - объединяет их в один МТекст");
             ed.WriteMessage("FixTrueColors - преобразует цвета из х,х,х в цвета NanoCad - особо часто требуется для печати");
-            ed.WriteMessage("FlattenDrawing - ");
+            ed.WriteMessage("FlattenDrawing - Сплющивает весь чертеж. Задает z=0 для всех объектов в т.ч в блоках. Также задает z=0 для всех точек сплайнов и т.д");
+            ed.WriteMessage("SR_SHOW_BLOCK_STRUCTURE - выписывает в консоль содержимое блока с указанием слоев. Вложенные блоки не рассматриваются");
+            ed.WriteMessage("SR_FIND_LAYER_IN_BLOCKS - выписывает в консоль блоки, которые используют указанный пользователем слой внутри себя");
+            ed.WriteMessage("SR_CLEAN_LAYER_IN_BLOCK - переносит все блоки с указанного пользователем слоя на слой \"0\" ");
 
         }
 
@@ -52,7 +61,7 @@ namespace SunRise
         [CommandMethod ("CheckDisk")]
         public static void CheckStatus()
         {
-            var ed = Application.DocumentManager.MdiActiveDocument.Editor;
+            var ed = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
             try
             {
                 // Запрос к WMI для получения модели и статуса всех дисков
@@ -82,7 +91,7 @@ namespace SunRise
         [CommandMethod("PaintItBlack")]
         public void PaintItBlack()
         {
-            var ed = Application.DocumentManager.MdiActiveDocument.Editor;
+            var ed = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
             try
             {
                 // 1. Подключаемся к COM
@@ -155,7 +164,7 @@ namespace SunRise
             List<string> uniteTexts = new List<string>();
             DBText text = new DBText();//чтобы передать шрифт
 
-            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Document doc = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             Editor ed = doc.Editor;
             Database db = doc.Database;
 
@@ -216,7 +225,7 @@ namespace SunRise
         [CommandMethod("FixTrueColors")]
         public void FixTrueColors()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null) return;
 
             var db = doc.Database;
@@ -359,7 +368,7 @@ namespace SunRise
         [CommandMethod("FlattenDrawing")]
         public void FlattenDrawing()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null) return;
 
             var db = doc.Database;
@@ -564,8 +573,280 @@ namespace SunRise
             ed.Regen();
         }
 
+        [CommandMethod("SR_SHOW_BLOCK_STRUCTURE")]
+        public void ShowBlockStructureCommand()
+        {
+            Document doc = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+            Database db = doc.Database;
 
+            string blockName = string.Empty;
 
+            // 1. Попытка интерактивного выбора блока кликом мыши
+            PromptEntityOptions peo = new PromptEntityOptions("\nВыберите блок на чертеже: ");
+            peo.SetRejectMessage("\nВыбранный объект не является блоком!");
+            peo.AddAllowedClass(typeof(BlockReference), true); // Разрешаем выбирать только BlockReference
 
+            PromptEntityResult per = ed.GetEntity(peo);
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                if (per.Status == PromptStatus.OK)
+                {
+                    // Пользователь успешно кликнул на блок
+                    BlockReference blkRef = (BlockReference)tr.GetObject(per.ObjectId, OpenMode.ForRead);
+
+                    // Получаем имя определения блока (BlockTableRecord)
+                    // Использование AnonymousBlockName / DynamicBlockTableRecord корректно для динамических блоков
+                    if (blkRef.IsDynamicBlock)
+                    {
+                        BlockTableRecord dbr = (BlockTableRecord)tr.GetObject(blkRef.DynamicBlockTableRecord, OpenMode.ForRead);
+                        blockName = dbr.Name;
+                    }
+                    else
+                    {
+                        blockName = blkRef.Name;
+                    }
+                }
+                else
+                {
+                    // 2. Альтернатива: если клик не удался, запрашиваем имя текстом
+                    ed.WriteMessage("\nБлок не выбран. Попробуем найти по имени.");
+                    PromptStringOptions pso = new PromptStringOptions("\nВведите имя блока вручную: ");
+                    pso.AllowSpaces = true;
+                    PromptResult pr = ed.GetString(pso);
+
+                    if (pr.Status != PromptStatus.OK || string.IsNullOrEmpty(pr.StringResult))
+                    {
+                        ed.WriteMessage("\nОперация отменена.");
+                        return;
+                    }
+                    blockName = pr.StringResult;
+                }
+
+                // 3. Анализ структуры выбранного или введенного блока
+                BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+
+                if (!bt.Has(blockName))
+                {
+                    ed.WriteMessage(string.Format("\nБлок с именем '{0}' не найден в базе данных чертежа.", blockName));
+                    return;
+                }
+
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[blockName], OpenMode.ForRead);
+
+                ed.WriteMessage(string.Format("\n\n--- Структура блока: {0} ---", blockName));
+
+                int elementsCount = 0;
+                Dictionary<string, int> stats = new Dictionary<string, int>();
+
+                foreach (ObjectId entityId in btr)
+                {
+                    Entity ent = tr.GetObject(entityId, OpenMode.ForRead) as Entity;
+                    if (ent != null)
+                    {
+                        elementsCount++;
+                        string objectType = ent.GetType().Name;
+                        string layerName = ent.Layer;
+
+                        ed.WriteMessage(string.Format("\nЭлемент #{0}: Тип = {1} | Слой = {2}", elementsCount, objectType, layerName));
+
+                        string key = string.Format("Тип: {0} на слое: {1}", objectType, layerName);
+                        if (stats.ContainsKey(key))
+                            stats[key]++;
+                        else
+                            stats[key] = 1;
+                    }
+                }
+
+                if (elementsCount == 0)
+                {
+                    ed.WriteMessage("\nЭтот блок пуст.");
+                }
+                else
+                {
+                    ed.WriteMessage("\n\n--- Сводная статистика по слоям блока ---");
+                    foreach (KeyValuePair<string, int> pair in stats)
+                    {
+                        ed.WriteMessage(string.Format("\n{0} — Количество: {1}", pair.Key, pair.Value));
+                    }
+                }
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("SR_FIND_LAYER_IN_BLOCKS")]
+        public void FindLayerInBlocksCommand()
+        {
+            Document doc = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+            Database db = doc.Database;
+
+            // 1. Запрашиваем имя проблемного слоя
+            PromptStringOptions pso = new PromptStringOptions("\nВведите имя слоя, который не удаляется: ");
+            pso.AllowSpaces = true;
+            PromptResult pr = ed.GetString(pso);
+
+            if (pr.Status != PromptStatus.OK || string.IsNullOrEmpty(pr.StringResult))
+            {
+                ed.WriteMessage("\nОперация отменена.");
+                return;
+            }
+
+            string targetLayer = pr.StringResult.Trim();
+
+            // Проверяем, существует ли вообще такой слой в системе
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                LayerTable lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+                if (!lt.Has(targetLayer))
+                {
+                    ed.WriteMessage(string.Format("\nОшибка: Слой '{0}' не существует в данном чертеже.", targetLayer));
+                    return;
+                }
+
+                // Вспомогательные служебные слои, которые нельзя удалить в принципе
+                if (targetLayer.Equals("0", StringComparison.OrdinalIgnoreCase) ||
+                    targetLayer.Equals("Defpoints", StringComparison.OrdinalIgnoreCase))
+                {
+                    ed.WriteMessage(string.Format("\nСлой '{0}' является системным, его невозможно удалить штатными средствами.", targetLayer));
+                    return;
+                }
+
+                ed.WriteMessage(string.Format("\nНачинаю сканирование блоков на наличие объектов на слое '{0}'...", targetLayer));
+
+                // Открываем таблицу блоков для глобального поиска
+                BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+
+                bool foundAny = false;
+                int totalCulprits = 0;
+
+                // 2. Обходим абсолютно все описания блоков в базе данных
+                foreach (ObjectId btrId in bt)
+                {
+                    BlockTableRecord btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
+
+                    // Пропускаем пространства листов и модели (это служебные блоки, нас интересуют только пользовательские)
+                    if (btr.IsLayout)
+                        continue;
+
+                    // Список элементов внутри текущего блока, которые сидят на искомом слое
+                    List<string> culpritsInBlock = new List<string>();
+
+                    // Перебираем всю геометрию внутри описания блока
+                    foreach (ObjectId entId in btr)
+                    {
+                        Entity ent = tr.GetObject(entId, OpenMode.ForRead) as Entity;
+                        if (ent != null)
+                        {
+                            // Сравниваем имя слоя без учета регистра
+                            if (ent.Layer.Equals(targetLayer, StringComparison.OrdinalIgnoreCase))
+                            {
+                                culpritsInBlock.Add(string.Format("{0} (ID: {1})", ent.GetType().Name, ent.Id.Handle.ToString()));
+                                totalCulprits++;
+                            }
+                        }
+                    }
+
+                    // Если в блоке нашли нарушителей — выводим отчет для пользователя
+                    if (culpritsInBlock.Count > 0)
+                    {
+                        foundAny = true;
+                        ed.WriteMessage(string.Format("\n\n[Блок: {0}] содержит объектов на слое: {1}", btr.Name, culpritsInBlock.Count));
+                        foreach (string info in culpritsInBlock)
+                        {
+                            ed.WriteMessage(string.Format("\n  -> {0}", info));
+                        }
+                    }
+                }
+
+                // 3. Финальный вердикт
+                if (!foundAny)
+                {
+                    ed.WriteMessage(string.Format("\n\nСлой '{0}' НЕ используется внутри геометрии блоков.", targetLayer));
+                    ed.WriteMessage("\nЕсли он всё еще не удаляется, возможные причины:");
+                    ed.WriteMessage("\n - На слое висят невидимые пустые текстовые строки или точки в пространстве модели.");
+                    ed.WriteMessage("\n - Слой используется в настройках размерных или текстовых стилей.");
+                    ed.WriteMessage("\n - На слое лежат внешние ссылки (XRef) или пустые вставки блоков.");
+                }
+                else
+                {
+                    ed.WriteMessage(string.Format("\n\nВсего найдено объектов: {0} внутри описаний блоков чертежа.", totalCulprits));
+                    ed.WriteMessage("\nРешение: Зайдите в редактор этих блоков (BEDIT) и переведите указанные объекты на слой '0' или удалите их.");
+                }
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("SR_CLEAN_LAYER_IN_BLOCKS")]
+        public void CleanLayerInBlocksCommand()
+        {
+            // 1. Показываем всплывающее окно с предупреждением (с явным указанием System.Windows.Forms)
+            System.Windows.Forms.DialogResult result = System.Windows.Forms.MessageBox.Show(
+                "Внимание! Данная команда внесет изменения в структуру блоков (включая анонимные) и перенесет объекты на слой '0'.\n\n" +
+                "Рекомендуется пересохранить и сделать резервную копию файла перед продолжением.\n\n" +
+                "Вы хотите продолжить?",
+                "Предупреждение [SunRise]",
+                System.Windows.Forms.MessageBoxButtons.YesNo,
+                System.Windows.Forms.MessageBoxIcon.Warning
+            );
+
+            // Если пользователь нажал "Нет" (или закрыл окно) — прерываем выполнение
+            if (result != System.Windows.Forms.DialogResult.Yes)
+            {
+                // Выводим сообщение в консоль nanoCAD, чтобы пользователь понял, почему ничего не произошло
+                HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor.WriteMessage("\nОперация отменена пользователем.");
+                return;
+            }
+
+            // 2. Основная логика работы (выполняется только если нажали "Да")
+            Document doc = HostMgd.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+            Database db = doc.Database;
+
+            PromptStringOptions pso = new PromptStringOptions("\nВведите имя слоя для очистки (переноса на слой '0'): ");
+            pso.AllowSpaces = true;
+            PromptResult pr = ed.GetString(pso);
+
+            if (pr.Status != PromptStatus.OK || string.IsNullOrEmpty(pr.StringResult)) return;
+            string targetLayer = pr.StringResult.Trim();
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                LayerTable lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+                if (!lt.Has(targetLayer))
+                {
+                    ed.WriteMessage(string.Format("\nСлой '{0}' не найден.", targetLayer));
+                    return;
+                }
+
+                BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                int changedCount = 0;
+
+                foreach (ObjectId btrId in bt)
+                {
+                    BlockTableRecord btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
+                    if (btr.IsLayout) continue;
+
+                    foreach (ObjectId entId in btr)
+                    {
+                        Entity ent = tr.GetObject(entId, OpenMode.ForRead) as Entity;
+                        if (ent != null && ent.Layer.Equals(targetLayer, StringComparison.OrdinalIgnoreCase))
+                        {
+                            ent.UpgradeOpen();
+                            ent.Layer = "0";
+                            changedCount++;
+                        }
+                    }
+                }
+
+                tr.Commit();
+                ed.WriteMessage(string.Format("\nУспешно очищено объектов: {0}. Теперь вы можете удалить слой штатными средствами.", changedCount));
+            }
+
+            ed.Regen();
+        }
     }
 }
